@@ -35,7 +35,7 @@
 #define DATA_URI    "https://raw.githubusercontent.com/killoff/esp32/refs/heads/main/sanitized.json"
 #define MAPPING_URI "https://raw.githubusercontent.com/killoff/esp32/refs/heads/main/mapping.json"
 
-#define NUM_LEDS  50
+#define NUM_LEDS  1500
 // NOTE: FastLED takes the raw ESP32 *GPIO* number here, not the Nano's "Dx"
 // silkscreen label. GPIO5 is the pin labelled D2 on the Arduino Nano ESP32.
 // If you wired the strip to the pin marked D5, use 8 instead of 5.
