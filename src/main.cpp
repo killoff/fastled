@@ -60,13 +60,16 @@ static const uint8_t  FETCH_ATTEMPTS          = 3;
 // ---------------------------------------------------------------- state
 
 static const size_t KEY_LEN     = 48;         // "building|number" + NUL
-static const size_t MAX_ENTRIES = NUM_LEDS;   // one mapped office per LED, max
+static const size_t MAX_ENTRIES = NUM_LEDS;   // one row per LED, max
 
+/** One row per (office, LED). An office mapped to several LEDs occupies
+ *  several consecutive rows with the same key; only the first carries
+ *  primary = 1 so office-level counts stay correct. */
 struct Entry {
   char     key[KEY_LEN];   // "Maxima 1|оф1"
   uint16_t led;            // index into leds[]
   uint8_t  status;         // 0 = never successfully fetched
-  uint8_t  reserved;
+  uint8_t  primary;        // 1 = first LED of this office (counted as an office)
 };
 
 static Entry  g_entries[MAX_ENTRIES];
@@ -103,7 +106,7 @@ static Preferences g_prefs;
 static ViewMode    g_viewMode = VIEW_ON;
 
 static const uint32_t CACHE_MAGIC   = 0x4C454431UL;  // 'LED1'
-static const uint16_t CACHE_VERSION = 1;
+static const uint16_t CACHE_VERSION = 2;   // 2: Entry.primary flag
 
 struct CacheHeader {
   uint32_t magic;
@@ -271,17 +274,24 @@ void boardSetViewMode(ViewMode mode) {
   render();
 }
 
-size_t boardEntryCount() { return g_count; }
+// Counts are per office, not per LED: only primary rows are counted.
+size_t boardEntryCount() {
+  size_t n = 0;
+  for (size_t i = 0; i < g_count; i++) if (g_entries[i].primary) n++;
+  return n;
+}
 
 size_t boardCountWithStatus(uint8_t status) {
   size_t n = 0;
-  for (size_t i = 0; i < g_count; i++) if (g_entries[i].status == status) n++;
+  for (size_t i = 0; i < g_count; i++)
+    if (g_entries[i].primary && g_entries[i].status == status) n++;
   return n;
 }
 
 size_t boardCountKnown() {
   size_t n = 0;
-  for (size_t i = 0; i < g_count; i++) if (g_entries[i].status != 0) n++;
+  for (size_t i = 0; i < g_count; i++)
+    if (g_entries[i].primary && g_entries[i].status != 0) n++;
   return n;
 }
 
@@ -360,9 +370,10 @@ static bool fetchConfig() {
   return true;
 }
 
-/** mapping.json is nested:  { "Maxima 1": { "оф1": 5, ... }, ... }
- *  Flattened here into "building|number" -> led. Statuses already known for a
- *  key are carried over so a mapping refresh never blanks the board. */
+/** mapping.json is nested:  { "Maxima 1": { "оф1": 5, "оф2": [11, 23], ... }, ... }
+ *  Each office maps to one LED (integer) or several (list of integers).
+ *  Flattened here into one row per "building|number" -> led. Statuses already
+ *  known for a key are carried over so a mapping refresh never blanks the board. */
 static bool fetchMapping() {
   WiFiClientSecure client;
   HTTPClient http;
@@ -393,28 +404,48 @@ static bool fetchMapping() {
       continue;
     }
     for (JsonPair room : rooms) {
-      if (n >= MAX_ENTRIES) { truncated = true; break; }
-
-      int led = room.value().as<int>();
-      if (!room.value().is<int>() || led < 0 || led >= NUM_LEDS) {
-        Serial.printf("[mapping] %s/%s -> %d out of range 0..%d, skipped\n",
-                      building.key().c_str(), room.key().c_str(), led, NUM_LEDS - 1);
+      // Value is either a single LED index or a list of them:
+      //   "оф1": 5      or      "оф2": [11, 23]
+      JsonVariantConst value = room.value();
+      JsonArrayConst   list  = value.as<JsonArrayConst>();
+      size_t ledsInRoom = list.isNull() ? 1 : list.size();
+      if (!list.isNull() && ledsInRoom == 0) {
+        Serial.printf("[mapping] %s/%s -> empty list, skipped\n",
+                      building.key().c_str(), room.key().c_str());
         continue;
       }
-      if (ledUsed[led]) {
-        Serial.printf("[mapping] LED %d assigned more than once (%s/%s)\n",
-                      led, building.key().c_str(), room.key().c_str());
+
+      char key[KEY_LEN];
+      makeKey(key, building.key().c_str(), room.key().c_str());
+      int old = findEntry(g_entries, g_count, key);
+      uint8_t carried = (old >= 0) ? g_entries[old].status : 0;  // carry last-known
+
+      bool first = true;
+      for (size_t li = 0; li < ledsInRoom; li++) {
+        JsonVariantConst v = list.isNull() ? value : list[li];
+        if (n >= MAX_ENTRIES) { truncated = true; break; }
+
+        int led = v.as<int>();
+        if (!v.is<int>() || led < 0 || led >= NUM_LEDS) {
+          Serial.printf("[mapping] %s/%s -> %d out of range 0..%d, skipped\n",
+                        building.key().c_str(), room.key().c_str(), led, NUM_LEDS - 1);
+          continue;
+        }
+        if (ledUsed[led]) {
+          Serial.printf("[mapping] LED %d assigned more than once (%s/%s)\n",
+                        led, building.key().c_str(), room.key().c_str());
+        }
+        ledUsed[led] = true;
+
+        memset(&tmp[n], 0, sizeof(tmp[n]));
+        memcpy(tmp[n].key, key, KEY_LEN);
+        tmp[n].led     = (uint16_t)led;
+        tmp[n].status  = carried;
+        tmp[n].primary = first ? 1 : 0;
+        first = false;
+        n++;
       }
-      ledUsed[led] = true;
-
-      memset(&tmp[n], 0, sizeof(tmp[n]));
-      makeKey(tmp[n].key, building.key().c_str(), room.key().c_str());
-      tmp[n].led    = (uint16_t)led;
-      tmp[n].status = 0;
-
-      int old = findEntry(g_entries, g_count, tmp[n].key);
-      if (old >= 0) tmp[n].status = g_entries[old].status;   // carry last-known
-      n++;
+      if (truncated) break;
     }
     if (truncated) break;
   }
@@ -430,7 +461,8 @@ static bool fetchMapping() {
 
   memcpy(g_entries, tmp, n * sizeof(Entry));
   g_count = n;
-  Serial.printf("[mapping] %u offices mapped\n", (unsigned)g_count);
+  Serial.printf("[mapping] %u offices mapped onto %u LEDs\n",
+                (unsigned)boardEntryCount(), (unsigned)g_count);
   return true;
 }
 
@@ -489,8 +521,12 @@ static bool fetchOffices() {
       if (idx >= 0) {
         int st = rec["system_status"] | 0;
         if (st < 0 || st > 255) st = 0;
-        newStatus[idx] = (uint8_t)st;
-        touched[idx]   = true;
+        // An office may occupy several rows (several LEDs); update them all.
+        for (size_t i = (size_t)idx; i < g_count; i++) {
+          if (strncmp(g_entries[i].key, key, KEY_LEN) != 0) continue;
+          newStatus[i] = (uint8_t)st;
+          touched[i]   = true;
+        }
         matched++;
       }
     }
@@ -513,8 +549,9 @@ static bool fetchOffices() {
     if (touched[i]) {
       g_entries[i].status = newStatus[i];
     } else {
-      Serial.printf("[data] '%s' absent from payload, keeping status %u\n",
-                    g_entries[i].key, (unsigned)g_entries[i].status);
+      if (g_entries[i].primary)
+        Serial.printf("[data] '%s' absent from payload, keeping status %u\n",
+                      g_entries[i].key, (unsigned)g_entries[i].status);
     }
   }
   g_lastFetchMs = millis();
