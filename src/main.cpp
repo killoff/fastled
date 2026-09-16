@@ -2,11 +2,13 @@
  * WS2812B office-status board  --  Arduino Nano ESP32 (ESP32-S3)
  *
  * Flow:
- *   1. Boot: restore last-good mapping+statuses from NVS and light the strip
- *      immediately, before Wi-Fi is up.
- *   2. Connect Wi-Fi, fetch config / mapping / data.
+ *   1. Boot: restore last-good mapping + statuses + view mode from NVS and
+ *      light the strip immediately, before Wi-Fi is up.
+ *   2. Connect Wi-Fi, fetch config / mapping / data, start the LAN web UI.
  *   3. Re-fetch every hour. Any resource that fails to fetch keeps its last
  *      known-good value (NVS-backed, so it survives a power cut).
+ *
+ * Web UI (see web.cpp): http://<ip>  --  four buttons, On / Off / Busy / Free.
  *
  * Memory notes:
  *   - sanitized.json is ~100 kB. It is NEVER loaded into RAM as a whole.
@@ -25,6 +27,10 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include <strings.h>   // strcasecmp
+
+#include "board.h"
+#include "web.h"
 
 // ---------------------------------------------------------------- settings
 
@@ -44,7 +50,7 @@
 #define BRIGHTNESS         100
 #define MAX_POWER_MA      2000   // strip PSU budget; FastLED dims to stay under it
 
-static const uint32_t REFRESH_INTERVAL_MS = 60UL * 60UL * 1000UL;  // 1 hour
+static const uint32_t REFRESH_INTERVAL_MS =  5UL * 60UL * 1000UL;  // normal cadence
 static const uint32_t RETRY_INTERVAL_MS   =  5UL * 60UL * 1000UL;  // after a failure
 static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 30000UL;
 static const uint16_t HTTP_CONNECT_TIMEOUT_MS = 10000;
@@ -94,6 +100,7 @@ struct ColorConfig {
 static ColorConfig g_colors;
 static CRGB        leds[NUM_LEDS];
 static Preferences g_prefs;
+static ViewMode    g_viewMode = VIEW_ON;
 
 static const uint32_t CACHE_MAGIC   = 0x4C454431UL;  // 'LED1'
 static const uint16_t CACHE_VERSION = 1;
@@ -103,6 +110,8 @@ struct CacheHeader {
   uint16_t version;
   uint16_t count;
 };
+
+static void render();
 
 // ---------------------------------------------------------------- helpers
 
@@ -225,6 +234,59 @@ static void saveEntriesToNvs() {
     Serial.println(F("[nvs] WARNING: failed to persist entries"));
   }
 }
+
+static void loadViewModeFromNvs() {
+  uint8_t v = g_prefs.getUChar("view", (uint8_t)VIEW_ON);
+  g_viewMode = (v <= (uint8_t)VIEW_FREE) ? (ViewMode)v : VIEW_ON;
+}
+
+// ---------------------------------------------------------------- board API
+// (declared in board.h, consumed by web.cpp)
+
+ViewMode boardGetViewMode() { return g_viewMode; }
+
+const char *boardViewModeName(ViewMode mode) {
+  switch (mode) {
+    case VIEW_OFF:  return "off";
+    case VIEW_BUSY: return "busy";
+    case VIEW_FREE: return "free";
+    case VIEW_ON:
+    default:        return "on";
+  }
+}
+
+bool boardParseViewMode(const char *name, ViewMode &out) {
+  if (!name) return false;
+  if      (!strcasecmp(name, "on"))   out = VIEW_ON;
+  else if (!strcasecmp(name, "off"))  out = VIEW_OFF;
+  else if (!strcasecmp(name, "busy")) out = VIEW_BUSY;
+  else if (!strcasecmp(name, "free")) out = VIEW_FREE;
+  else return false;
+  return true;
+}
+
+void boardSetViewMode(ViewMode mode) {
+  g_viewMode = mode;
+  g_prefs.putUChar("view", (uint8_t)mode);   // survives a power cut
+  render();
+}
+
+size_t boardEntryCount() { return g_count; }
+
+size_t boardCountWithStatus(uint8_t status) {
+  size_t n = 0;
+  for (size_t i = 0; i < g_count; i++) if (g_entries[i].status == status) n++;
+  return n;
+}
+
+size_t boardCountKnown() {
+  size_t n = 0;
+  for (size_t i = 0; i < g_count; i++) if (g_entries[i].status != 0) n++;
+  return n;
+}
+
+static uint32_t g_lastFetchMs = 0;          // millis() of last good data fetch
+uint32_t boardLastFetchMs() { return g_lastFetchMs; }
 
 // ---------------------------------------------------------------- http
 
@@ -455,6 +517,8 @@ static bool fetchOffices() {
                     g_entries[i].key, (unsigned)g_entries[i].status);
     }
   }
+  g_lastFetchMs = millis();
+  if (g_lastFetchMs == 0) g_lastFetchMs = 1;   // 0 means "never"
   Serial.printf("[data] %u records scanned, %u mapped offices updated\n",
                 (unsigned)seen, (unsigned)matched);
   return true;
@@ -464,10 +528,26 @@ static bool fetchOffices() {
 
 static void render() {
   FastLED.clear();
-  for (size_t i = 0; i < g_count; i++) {
-    uint16_t led = g_entries[i].led;
-    if (led >= NUM_LEDS) continue;                 // hard bounds guard
-    leds[led] = statusToColor(g_entries[i].status);
+  if (g_viewMode != VIEW_OFF) {
+    for (size_t i = 0; i < g_count; i++) {
+      uint16_t led = g_entries[i].led;
+      if (led >= NUM_LEDS) continue;                 // hard bounds guard
+      uint8_t st = g_entries[i].status;
+
+      switch (g_viewMode) {
+        case VIEW_ON:
+          leds[led] = statusToColor(st);
+          break;
+        case VIEW_BUSY:
+          if (st == STATUS_SOLD) leds[led] = statusToColor(STATUS_SOLD);
+          break;
+        case VIEW_FREE:
+          if (st == STATUS_FREE) leds[led] = statusToColor(STATUS_FREE);
+          break;
+        default:
+          break;
+      }
+    }
   }
   FastLED.show();                                  // one show() for the strip
 }
@@ -506,7 +586,8 @@ template <typename Fn>
 static bool withRetries(const char *what, Fn fn) {
   for (uint8_t attempt = 1; attempt <= FETCH_ATTEMPTS; attempt++) {
     if (fn()) return true;
-    Serial.printf("[%s] attempt %u/%u failed\n", what, attempt, FETCH_ATTEMPTS);
+    Serial.printf("[%s] attempt %u/%u failed\n", what,
+                  (unsigned)attempt, (unsigned)FETCH_ATTEMPTS);
     if (attempt < FETCH_ATTEMPTS) delay(2000UL * attempt);
   }
   return false;
@@ -528,7 +609,7 @@ static void refreshAll() {
   bool dataOk = withRetries("data", fetchOffices);
 
   if (mapOk || dataOk) saveEntriesToNvs();
-  render();
+  render();                                        // honours the current mode
 
   Serial.printf("[refresh] free heap after:  %u (min ever %u)\n",
                 (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap());
@@ -554,6 +635,8 @@ void setup() {
   g_prefs.begin("ledboard", false);
   loadColorsFromNvs();
   loadEntriesFromNvs();
+  loadViewModeFromNvs();
+  Serial.printf("[boot] view mode: %s\n", boardViewModeName(g_viewMode));
   render();                       // show last-good state before Wi-Fi is up
 
   WiFi.mode(WIFI_STA);
@@ -561,11 +644,18 @@ void setup() {
   WiFi.setAutoReconnect(true);
 
   refreshAll();
+  webBegin();                     // control panel on http://<ip>
 }
 
 void loop() {
+  webLoop();
+
   if ((uint32_t)(millis() - g_lastAttemptMs) >= g_nextDelayMs) {
     refreshAll();                 // millis() rollover-safe (unsigned subtraction)
   }
-  delay(1000);
+
+  // Short delay so the web server stays responsive. Note that the strip is
+  // unreachable for the ~10-30 s an hourly refresh takes -- loop() is blocked
+  // for the duration of the fetch.
+  delay(2);
 }
