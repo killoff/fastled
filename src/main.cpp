@@ -195,30 +195,29 @@ static void saveColorsToNvs() {
   g_prefs.putBytes("colors", &g_colors, sizeof(g_colors));
 }
 
+/** The cache is two NVS blobs: "hdr" (magic/version/count) and "entries"
+ *  (the raw Entry table). Reading straight into g_entries avoids a second
+ *  MAX_ENTRIES-sized staging buffer, which does not fit in DRAM at 1500 LEDs. */
 static void loadEntriesFromNvs() {
-  size_t len = g_prefs.getBytesLength("entries");
-  if (len < sizeof(CacheHeader)) return;
-
-  static uint8_t buf[sizeof(CacheHeader) + MAX_ENTRIES * sizeof(Entry)];
-  if (len > sizeof(buf)) {
-    Serial.println(F("[nvs] cached entries larger than buffer, ignoring"));
-    return;
-  }
-  if (g_prefs.getBytes("entries", buf, len) != len) return;
-
   CacheHeader h;
-  memcpy(&h, buf, sizeof(h));
+  if (g_prefs.getBytesLength("hdr") != sizeof(h) ||
+      g_prefs.getBytes("hdr", &h, sizeof(h)) != sizeof(h)) return;
   if (h.magic != CACHE_MAGIC || h.version != CACHE_VERSION) {
     Serial.println(F("[nvs] cache magic/version mismatch, ignoring"));
     return;
   }
-  if (h.count > MAX_ENTRIES) return;
-  if (len != sizeof(CacheHeader) + (size_t)h.count * sizeof(Entry)) {
+  if (h.count == 0 || h.count > MAX_ENTRIES) return;
+
+  size_t len = (size_t)h.count * sizeof(Entry);
+  if (g_prefs.getBytesLength("entries") != len) {
     Serial.println(F("[nvs] cache size mismatch, ignoring"));
     return;
   }
-
-  memcpy(g_entries, buf + sizeof(CacheHeader), (size_t)h.count * sizeof(Entry));
+  if (g_prefs.getBytes("entries", g_entries, len) != len) {
+    memset(g_entries, 0, len);           // partial read: don't trust anything
+    g_count = 0;
+    return;
+  }
   g_count = h.count;
   for (size_t i = 0; i < g_count; i++) {
     g_entries[i].key[KEY_LEN - 1] = '\0';
@@ -228,13 +227,16 @@ static void loadEntriesFromNvs() {
 }
 
 static void saveEntriesToNvs() {
-  static uint8_t buf[sizeof(CacheHeader) + MAX_ENTRIES * sizeof(Entry)];
-  CacheHeader h = { CACHE_MAGIC, CACHE_VERSION, (uint16_t)g_count };
-  memcpy(buf, &h, sizeof(h));
-  memcpy(buf + sizeof(h), g_entries, g_count * sizeof(Entry));
-  size_t len = sizeof(h) + g_count * sizeof(Entry);
-  if (g_prefs.putBytes("entries", buf, len) != len) {
+  // Entries first, header last: a header is only valid if the table it
+  // describes was written completely.
+  size_t len = g_count * sizeof(Entry);
+  if (g_prefs.putBytes("entries", g_entries, len) != len) {
     Serial.println(F("[nvs] WARNING: failed to persist entries"));
+    return;
+  }
+  CacheHeader h = { CACHE_MAGIC, CACHE_VERSION, (uint16_t)g_count };
+  if (g_prefs.putBytes("hdr", &h, sizeof(h)) != sizeof(h)) {
+    Serial.println(F("[nvs] WARNING: failed to persist cache header"));
   }
 }
 
@@ -392,9 +394,16 @@ static bool fetchMapping() {
     return false;
   }
 
-  static Entry tmp[MAX_ENTRIES];
+  // Scratch table lives on the heap only while parsing: a second static
+  // MAX_ENTRIES table (78 kB at 1500 LEDs) would not fit in DRAM.
+  Entry *tmp = (Entry *)calloc(MAX_ENTRIES, sizeof(Entry));
+  if (!tmp) {
+    Serial.println(F("[mapping] out of memory for scratch table"));
+    return false;
+  }
   size_t n = 0;
-  bool ledUsed[NUM_LEDS] = { false };
+  static bool ledUsed[NUM_LEDS];
+  memset(ledUsed, 0, sizeof(ledUsed));
   bool truncated = false;
 
   for (JsonPair building : root) {
@@ -456,10 +465,12 @@ static bool fetchMapping() {
   }
   if (n == 0) {
     Serial.println(F("[mapping] empty result, keeping previous mapping"));
+    free(tmp);
     return false;
   }
 
   memcpy(g_entries, tmp, n * sizeof(Entry));
+  free(tmp);
   g_count = n;
   Serial.printf("[mapping] %u offices mapped onto %u LEDs\n",
                 (unsigned)boardEntryCount(), (unsigned)g_count);
