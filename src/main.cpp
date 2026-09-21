@@ -41,6 +41,15 @@
 #define DATA_URI    "https://raw.githubusercontent.com/killoff/esp32/refs/heads/main/sanitized.json"
 #define MAPPING_URI "https://raw.githubusercontent.com/killoff/esp32/refs/heads/main/mapping.json"
 
+// ---- test / force mode -------------------------------------------------
+// When TEST_MODE is true every LED is lit in TEST_MODE_COLOR at
+// TEST_MODE_BRIGHTNESS, no matter what config / mapping / data say and no
+// matter which view mode is selected. Fetching still runs in the background
+// so the web UI keeps working; only the strip output is overridden.
+#define TEST_MODE             false
+#define TEST_MODE_COLOR       "#FF0000"   // "#RRGGBB"
+#define TEST_MODE_BRIGHTNESS  100         // 0..100 (%)
+
 #define NUM_LEDS  1500
 // NOTE: FastLED takes the raw ESP32 *GPIO* number here, not the Nano's "Dx"
 // silkscreen label. GPIO5 is the pin labelled D2 on the Arduino Nano ESP32.
@@ -575,6 +584,18 @@ static bool fetchOffices() {
 // ---------------------------------------------------------------- rendering
 
 static void render() {
+#if TEST_MODE
+  {
+    CRGB c;
+    if (!hexToCRGB(TEST_MODE_COLOR, c)) c = CRGB::Red;   // bad literal -> still visible
+    static_assert(TEST_MODE_BRIGHTNESS >= 0 && TEST_MODE_BRIGHTNESS <= 100,
+                  "TEST_MODE_BRIGHTNESS must be 0..100");
+    FastLED.setBrightness((uint8_t)((TEST_MODE_BRIGHTNESS * 255 + 50) / 100));
+    fill_solid(leds, NUM_LEDS, c);
+    FastLED.show();
+    return;
+  }
+#endif
   FastLED.clear();
   if (g_viewMode != VIEW_OFF) {
     for (size_t i = 0; i < g_count; i++) {
@@ -674,6 +695,9 @@ void setup() {
   uint32_t t0 = millis();
   while (!Serial && (millis() - t0) < 2000) delay(10);   // USB-CDC, don't block forever
   Serial.println(F("\n[boot] office status board"));
+#if TEST_MODE
+  Serial.println(F("[boot] *** TEST_MODE: all LEDs forced to " TEST_MODE_COLOR " ***"));
+#endif
 
   FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);
   FastLED.setBrightness(BRIGHTNESS);
