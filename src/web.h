@@ -1,8 +1,9 @@
 /**
  * web.h -- tiny LAN control panel for the LED board.
  *
- * Serves one page with four buttons (On / Off / Busy / Free) plus a JSON
- * status endpoint. No auth: anyone on the same Wi-Fi can press the buttons.
+ * Serves one page with three status toggles (ВІЛЬНО / ПРОДАНО / РЕЗЕРВ), a
+ * STANDBY toggle, and a JSON status endpoint. No auth: anyone on the same
+ * Wi-Fi can press the buttons.
  */
 #pragma once
 

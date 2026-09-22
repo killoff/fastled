@@ -2,13 +2,15 @@
  * WS2812B office-status board  --  Arduino Nano ESP32 (ESP32-S3)
  *
  * Flow:
- *   1. Boot: restore last-good mapping + statuses + view mode from NVS and
+ *   1. Boot: restore last-good mapping + statuses + status toggles from NVS and
  *      light the strip immediately, before Wi-Fi is up.
  *   2. Connect Wi-Fi, fetch config / mapping / data, start the LAN web UI.
  *   3. Re-fetch every hour. Any resource that fails to fetch keeps its last
  *      known-good value (NVS-backed, so it survives a power cut).
  *
- * Web UI (see web.cpp): http://<ip>  --  four buttons, On / Off / Busy / Free.
+ * Web UI (see web.cpp): http://<ip>  --  three status toggles
+ * (ВІЛЬНО / ПРОДАНО / РЕЗЕРВ, persisted) and a STANDBY toggle (not persisted;
+ * blanks the strip, stops sending data on LED_PIN, drives STANDBY_LED_PIN HIGH).
  *
  * Memory notes:
  *   - sanitized.json is ~100 kB. It is NEVER loaded into RAM as a whole.
@@ -55,6 +57,9 @@
 // silkscreen label. GPIO5 is the pin labelled D2 on the Arduino Nano ESP32.
 // If you wired the strip to the pin marked D5, use 8 instead of 5.
 #define LED_PIN   5
+// Plain digital output, not a WS2812 data line: HIGH while STANDBY is on,
+// LOW otherwise. GPIO8 is the pin labelled D5 on the Arduino Nano ESP32.
+#define STANDBY_LED_PIN 8
 
 #define BRIGHTNESS         100
 #define MAX_POWER_MA      2000   // strip PSU budget; FastLED dims to stay under it
@@ -112,7 +117,8 @@ struct ColorConfig {
 static ColorConfig g_colors;
 static CRGB        leds[NUM_LEDS];
 static Preferences g_prefs;
-static ViewMode    g_viewMode = VIEW_ON;
+static uint8_t     g_showMask = SHOW_MASK_ALL;   // which statuses are lit
+static bool        g_standby  = false;           // never persisted
 
 static const uint32_t CACHE_MAGIC   = 0x4C454431UL;  // 'LED1'
 static const uint16_t CACHE_VERSION = 2;   // 2: Entry.primary flag
@@ -249,40 +255,49 @@ static void saveEntriesToNvs() {
   }
 }
 
-static void loadViewModeFromNvs() {
-  uint8_t v = g_prefs.getUChar("view", (uint8_t)VIEW_ON);
-  g_viewMode = (v <= (uint8_t)VIEW_FREE) ? (ViewMode)v : VIEW_ON;
+static void loadShowMaskFromNvs() {
+  // Key "show" replaces the pre-toggle "view" byte; a board that never saved
+  // "show" boots with all three toggles on.
+  g_showMask = g_prefs.getUChar("show", SHOW_MASK_ALL) & SHOW_MASK_ALL;
 }
 
 // ---------------------------------------------------------------- board API
 // (declared in board.h, consumed by web.cpp)
 
-ViewMode boardGetViewMode() { return g_viewMode; }
+uint8_t boardGetShowMask() { return g_showMask; }
 
-const char *boardViewModeName(ViewMode mode) {
-  switch (mode) {
-    case VIEW_OFF:  return "off";
-    case VIEW_BUSY: return "busy";
-    case VIEW_FREE: return "free";
-    case VIEW_ON:
-    default:        return "on";
+bool boardStatusToggleable(uint8_t status) {
+  return status == STATUS_FREE || status == STATUS_RESERVE || status == STATUS_SOLD;
+}
+
+void boardSetShowMask(uint8_t mask) {
+  g_showMask = mask & SHOW_MASK_ALL;
+  g_prefs.putUChar("show", g_showMask);   // survives a power cut
+  render();
+}
+
+bool boardGetStandby() { return g_standby; }
+
+void boardSetStandby(bool on) {
+  if (on == g_standby) return;
+  g_standby = on;
+  if (on) {
+    // One last frame of black so the strip actually goes dark, then render()
+    // stops pushing data to LED_PIN for as long as standby lasts.
+#if !TEST_MODE
+    FastLED.clear();
+    FastLED.show();
+#endif
+    digitalWrite(STANDBY_LED_PIN, HIGH);
+  } else {
+    digitalWrite(STANDBY_LED_PIN, LOW);
+    render();                              // resume with the current picture
   }
 }
 
-bool boardParseViewMode(const char *name, ViewMode &out) {
-  if (!name) return false;
-  if      (!strcasecmp(name, "on"))   out = VIEW_ON;
-  else if (!strcasecmp(name, "off"))  out = VIEW_OFF;
-  else if (!strcasecmp(name, "busy")) out = VIEW_BUSY;
-  else if (!strcasecmp(name, "free")) out = VIEW_FREE;
-  else return false;
-  return true;
-}
-
-void boardSetViewMode(ViewMode mode) {
-  g_viewMode = mode;
-  g_prefs.putUChar("view", (uint8_t)mode);   // survives a power cut
-  render();
+const char *boardStatusColorHex(uint8_t status) {
+  size_t idx = (status >= 1 && status <= 7) ? (size_t)(status - 1) : COLOR_UNKNOWN;
+  return g_colors.hex[idx];
 }
 
 // Counts are per office, not per LED: only primary rows are counted.
@@ -596,26 +611,15 @@ static void render() {
     return;
   }
 #endif
-  FastLED.clear();
-  if (g_viewMode != VIEW_OFF) {
-    for (size_t i = 0; i < g_count; i++) {
-      uint16_t led = g_entries[i].led;
-      if (led >= NUM_LEDS) continue;                 // hard bounds guard
-      uint8_t st = g_entries[i].status;
+  if (g_standby) return;   // strip already blanked; send nothing to LED_PIN
 
-      switch (g_viewMode) {
-        case VIEW_ON:
-          leds[led] = statusToColor(st);
-          break;
-        case VIEW_BUSY:
-          if (st == STATUS_SOLD) leds[led] = statusToColor(STATUS_SOLD);
-          break;
-        case VIEW_FREE:
-          if (st == STATUS_FREE) leds[led] = statusToColor(STATUS_FREE);
-          break;
-        default:
-          break;
-      }
+  FastLED.clear();
+  for (size_t i = 0; i < g_count; i++) {
+    uint16_t led = g_entries[i].led;
+    if (led >= NUM_LEDS) continue;                 // hard bounds guard
+    uint8_t st = g_entries[i].status;
+    if (st < 8 && (g_showMask & (uint8_t)(1u << st))) {
+      leds[led] = statusToColor(st);
     }
   }
   FastLED.show();                                  // one show() for the strip
@@ -678,7 +682,7 @@ static void refreshAll() {
   bool dataOk = withRetries("data", fetchOffices);
 
   if (mapOk || dataOk) saveEntriesToNvs();
-  render();                                        // honours the current mode
+  render();                                        // honours toggles / standby
 
   Serial.printf("[refresh] free heap after:  %u (min ever %u)\n",
                 (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap());
@@ -699,6 +703,9 @@ void setup() {
   Serial.println(F("[boot] *** TEST_MODE: all LEDs forced to " TEST_MODE_COLOR " ***"));
 #endif
 
+  pinMode(STANDBY_LED_PIN, OUTPUT);
+  digitalWrite(STANDBY_LED_PIN, LOW);   // standby is always off after boot
+
   FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);
   FastLED.setBrightness(BRIGHTNESS);
   FastLED.setMaxPowerInVoltsAndMilliamps(5, MAX_POWER_MA);
@@ -707,8 +714,10 @@ void setup() {
   g_prefs.begin("ledboard", false);
   loadColorsFromNvs();
   loadEntriesFromNvs();
-  loadViewModeFromNvs();
-  Serial.printf("[boot] view mode: %s\n", boardViewModeName(g_viewMode));
+  loadShowMaskFromNvs();
+  Serial.printf("[boot] show: free=%d reserve=%d sold=%d\n",
+                !!(g_showMask & SHOW_BIT_FREE), !!(g_showMask & SHOW_BIT_RESERVE),
+                !!(g_showMask & SHOW_BIT_SOLD));
   render();                       // show last-good state before Wi-Fi is up
 
   WiFi.mode(WIFI_STA);
