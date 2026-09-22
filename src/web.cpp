@@ -27,7 +27,7 @@ static const char kIndexHtml[] PROGMEM = R"HTML(<!doctype html>
 <html lang="uk"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>LED board</title>
+<title>MAXIMA Residence</title>
 <style>
 :root{color-scheme:dark;--bg:#14161a;--card:#1e2128;--line:#31363f;--fg:#eceef2;--mut:#9aa2b1}
 *{box-sizing:border-box}
@@ -51,12 +51,9 @@ button[aria-pressed=false] .lbl{color:var(--mut)}
 .lbl{font-size:14px;letter-spacing:.04em}
 .hint{font-size:11px;font-weight:400;color:var(--mut)}
 #standby{margin-top:12px;width:100%;flex-direction:row;justify-content:center;gap:12px;padding:16px;--c:#ffb020}
-.card{margin-top:20px;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px 16px}
-dl{display:grid;grid-template-columns:auto 1fr;gap:6px 16px;margin:0;font-size:13px}
-dt{color:var(--mut)}dd{margin:0;text-align:right;font-variant-numeric:tabular-nums}
 #msg{min-height:20px;margin-top:12px;font-size:13px;color:var(--mut)}
 </style></head><body><main>
-<h1>Office LED board</h1>
+<h1>MAXIMA Residence</h1>
 <p class="sub">Anyone on this Wi-Fi can change what the strip shows.</p>
 <div class="grid">
   <button data-s="1" aria-pressed="true"><span class="dot"></span><span class="lbl">ВІЛЬНО</span></button>
@@ -65,13 +62,6 @@ dt{color:var(--mut)}dd{margin:0;text-align:right;font-variant-numeric:tabular-nu
 </div>
 <button id="standby" aria-pressed="false"><span class="dot"></span><span class="lbl">STANDBY</span><span class="hint">strip off, pin 8 high</span></button>
 <div id="msg"></div>
-<div class="card"><dl>
-  <dt>Mapped offices</dt><dd id="s-count">&mdash;</dd>
-  <dt>Free / Reserve / Sold</dt><dd id="s-frs">&mdash;</dd>
-  <dt>Last data fetch</dt><dd id="s-fetch">&mdash;</dd>
-  <dt>Uptime</dt><dd id="s-up">&mdash;</dd>
-  <dt>Free heap</dt><dd id="s-heap">&mdash;</dd>
-</dl></div>
 </main>
 <script>
 const tg=[...document.querySelectorAll('button[data-s]')];
@@ -79,17 +69,10 @@ const sb=document.getElementById('standby');
 const all=[...tg,sb];
 const msg=document.getElementById('msg');
 let st=null;
-const ago=s=>s<0?'never':s<60?s+'s ago':s<3600?Math.floor(s/60)+'m ago':Math.floor(s/3600)+'h '+Math.floor(s%3600/60)+'m ago';
-const dur=s=>s<3600?Math.floor(s/60)+'m':s<86400?Math.floor(s/3600)+'h '+Math.floor(s%3600/60)+'m':Math.floor(s/86400)+'d '+Math.floor(s%86400/3600)+'h';
 function paint(d){
   st=d;
   tg.forEach(b=>{const s=+b.dataset.s;b.setAttribute('aria-pressed',String(!!(d.show&(1<<s))));b.style.setProperty('--c',d.colors[s]||'#9aa2b1');});
   sb.setAttribute('aria-pressed',String(!!d.standby));
-  document.getElementById('s-count').textContent=d.entries+(d.known<d.entries?' ('+(d.entries-d.known)+' unknown)':'');
-  document.getElementById('s-frs').textContent=d.free+' / '+d.reserve+' / '+d.sold;
-  document.getElementById('s-fetch').textContent=ago(d.fetch_age_s);
-  document.getElementById('s-up').textContent=dur(d.uptime_s);
-  document.getElementById('s-heap').textContent=(d.heap/1024).toFixed(1)+' kB';
 }
 async function call(url){
   all.forEach(b=>b.disabled=true); msg.textContent='';
