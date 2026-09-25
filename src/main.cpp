@@ -60,6 +60,11 @@
 // Plain digital output, not a WS2812 data line: HIGH while STANDBY is on,
 // LOW otherwise. GPIO8 is the pin labelled D5 on the Arduino Nano ESP32.
 #define STANDBY_LED_PIN 8
+// Auto-standby: minutes without a click on any of the three status toggles
+// (counted from boot as well) before the board switches itself to STANDBY.
+#define STANDBY_AFTER_MINUTES 10
+// Debug blink: half-period of the red/green/blue cycle on one LED.
+#define BLINK_STEP_MS 400
 
 #define BRIGHTNESS         100
 #define MAX_POWER_MA      2000   // strip PSU budget; FastLED dims to stay under it
@@ -119,6 +124,10 @@ static CRGB        leds[NUM_LEDS];
 static Preferences g_prefs;
 static uint8_t     g_showMask = SHOW_MASK_ALL;   // which statuses are lit
 static bool        g_standby  = false;           // never persisted
+static uint32_t    g_lastActivityMs = 0;         // last status-toggle click
+static int32_t     g_blinkLed = -1;              // >= 0: debug-blink this LED
+static uint32_t    g_blinkLastMs = 0;
+static uint8_t     g_blinkPhase = 0;             // 0 red, 1 green, 2 blue
 
 static const uint32_t CACHE_MAGIC   = 0x4C454431UL;  // 'LED1'
 static const uint16_t CACHE_VERSION = 2;   // 2: Entry.primary flag
@@ -255,12 +264,6 @@ static void saveEntriesToNvs() {
   }
 }
 
-static void loadShowMaskFromNvs() {
-  // Key "show" replaces the pre-toggle "view" byte; a board that never saved
-  // "show" boots with all three toggles on.
-  g_showMask = g_prefs.getUChar("show", SHOW_MASK_ALL) & SHOW_MASK_ALL;
-}
-
 // ---------------------------------------------------------------- board API
 // (declared in board.h, consumed by web.cpp)
 
@@ -270,10 +273,19 @@ bool boardStatusToggleable(uint8_t status) {
   return status == STATUS_FREE || status == STATUS_RESERVE || status == STATUS_SOLD;
 }
 
+static void stopBlink() { g_blinkLed = -1; }
+
+/** A click on one of the three status toggles: leaves standby, stops any
+ *  debug blink, restarts the auto-standby countdown, then repaints. */
 void boardSetShowMask(uint8_t mask) {
   g_showMask = mask & SHOW_MASK_ALL;
-  g_prefs.putUChar("show", g_showMask);   // survives a power cut
-  render();
+  g_lastActivityMs = millis();
+  stopBlink();
+  if (g_standby) {
+    boardSetStandby(false);                // renders
+  } else {
+    render();
+  }
 }
 
 bool boardGetStandby() { return g_standby; }
@@ -281,6 +293,7 @@ bool boardGetStandby() { return g_standby; }
 void boardSetStandby(bool on) {
   if (on == g_standby) return;
   g_standby = on;
+  stopBlink();
   if (on) {
     // One last frame of black so the strip actually goes dark, then render()
     // stops pushing data to LED_PIN for as long as standby lasts.
@@ -291,8 +304,46 @@ void boardSetStandby(bool on) {
     digitalWrite(STANDBY_LED_PIN, HIGH);
   } else {
     digitalWrite(STANDBY_LED_PIN, LOW);
+    g_lastActivityMs = millis();           // don't re-enter standby at once
     render();                              // resume with the current picture
   }
+}
+
+bool boardStartBlink(uint16_t led) {
+  if (led >= NUM_LEDS) return false;
+  if (g_standby) boardSetStandby(false);   // blink needs data on LED_PIN
+  g_lastActivityMs = millis();
+  g_blinkLed     = led;
+  g_blinkPhase   = 0;
+  g_blinkLastMs  = 0;                      // first tick fires immediately
+  Serial.printf("[blink] LED %u\n", (unsigned)led);
+  return true;
+}
+
+int32_t boardBlinkLed() { return g_blinkLed; }
+
+/** Called from loop(): advances the debug blink and the auto-standby timer. */
+static void boardTick() {
+  uint32_t now = millis();
+
+  if (!g_standby && STANDBY_AFTER_MINUTES > 0 &&
+      (uint32_t)(now - g_lastActivityMs) >= (uint32_t)STANDBY_AFTER_MINUTES * 60000UL) {
+    Serial.printf("[standby] no activity for %d min, entering standby\n",
+                  STANDBY_AFTER_MINUTES);
+    boardSetStandby(true);                 // also stops any blink
+    return;
+  }
+
+#if !TEST_MODE
+  if (g_blinkLed >= 0 && (uint32_t)(now - g_blinkLastMs) >= BLINK_STEP_MS) {
+    g_blinkLastMs = now;
+    static const CRGB kCycle[3] = { CRGB::Red, CRGB::Green, CRGB::Blue };
+    FastLED.clear();
+    leds[g_blinkLed] = kCycle[g_blinkPhase];
+    FastLED.show();
+    g_blinkPhase = (uint8_t)((g_blinkPhase + 1) % 3);
+  }
+#endif
 }
 
 const char *boardStatusColorHex(uint8_t status) {
@@ -611,7 +662,8 @@ static void render() {
     return;
   }
 #endif
-  if (g_standby) return;   // strip already blanked; send nothing to LED_PIN
+  if (g_standby) return;      // strip already blanked; send nothing to LED_PIN
+  if (g_blinkLed >= 0) return; // debug blink owns the strip until a toggle click
 
   FastLED.clear();
   for (size_t i = 0; i < g_count; i++) {
@@ -714,10 +766,8 @@ void setup() {
   g_prefs.begin("ledboard", false);
   loadColorsFromNvs();
   loadEntriesFromNvs();
-  loadShowMaskFromNvs();
-  Serial.printf("[boot] show: free=%d reserve=%d sold=%d\n",
-                !!(g_showMask & SHOW_BIT_FREE), !!(g_showMask & SHOW_BIT_RESERVE),
-                !!(g_showMask & SHOW_BIT_SOLD));
+  g_showMask = SHOW_MASK_ALL;     // every boot starts with all three toggles on
+  g_lastActivityMs = millis();    // auto-standby countdown starts now
   render();                       // show last-good state before Wi-Fi is up
 
   WiFi.mode(WIFI_STA);
@@ -730,6 +780,7 @@ void setup() {
 
 void loop() {
   webLoop();
+  boardTick();                  // auto-standby + debug blink
 
   if ((uint32_t)(millis() - g_lastAttemptMs) >= g_nextDelayMs) {
     refreshAll();                 // millis() rollover-safe (unsigned subtraction)

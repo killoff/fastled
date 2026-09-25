@@ -49,7 +49,15 @@ button[aria-pressed=true]{border-color:var(--c);box-shadow:inset 0 0 0 1px var(-
 button[aria-pressed=true] .dot{opacity:1;box-shadow:0 0 10px var(--c)}
 button[aria-pressed=false] .lbl{color:var(--mut)}
 .lbl{font-size:14px;letter-spacing:.04em}
-.hint{font-size:11px;font-weight:400;color:var(--mut)}
+/* service form: sits at the bottom, painted in the page background so it is
+   invisible until someone clicks into it and types */
+#svc{margin-top:48px;display:flex;gap:8px}
+#svc input,#svc button{background:var(--bg);border:1px solid var(--bg);color:var(--bg);
+     border-radius:8px;padding:10px 12px;font:inherit;outline:none;box-shadow:none;transform:none}
+#svc input{flex:1;min-width:0;color:var(--fg);caret-color:var(--fg);-moz-appearance:textfield}
+#svc input::-webkit-outer-spin-button,#svc input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+#svc button{display:block;font-weight:400}
+#svc button:hover:not(:disabled),#svc input:hover{border-color:var(--bg)}
 #standby{margin-top:12px;width:100%;flex-direction:row;justify-content:center;gap:12px;padding:16px;--c:#ffb020}
 #msg{min-height:20px;margin-top:12px;font-size:13px;color:var(--mut)}
 </style></head><body><main>
@@ -60,12 +68,17 @@ button[aria-pressed=false] .lbl{color:var(--mut)}
   <button data-s="4" aria-pressed="true"><span class="dot"></span><span class="lbl">ПРОДАНО</span></button>
   <button data-s="2" aria-pressed="true"><span class="dot"></span><span class="lbl">РЕЗЕРВ</span></button>
 </div>
-<button id="standby" aria-pressed="false"><span class="dot"></span><span class="lbl">STANDBY</span><span class="hint">strip off, pin 8 high</span></button>
+<button id="standby" aria-pressed="false"><span class="dot"></span><span class="lbl">STANDBY</span></button>
 <div id="msg"></div>
+<form id="svc" autocomplete="off">
+  <input id="led" type="number" inputmode="numeric" min="0" step="1" aria-label="LED number">
+  <button id="go" type="submit">blink</button>
+</form>
 </main>
 <script>
 const tg=[...document.querySelectorAll('button[data-s]')];
 const sb=document.getElementById('standby');
+const svc=document.getElementById('svc'), ledIn=document.getElementById('led');
 const all=[...tg,sb];
 const msg=document.getElementById('msg');
 let st=null;
@@ -85,6 +98,7 @@ async function call(url){
 }
 tg.forEach(b=>b.onclick=()=>{ if(!st) return; const s=+b.dataset.s; const on=!(st.show&(1<<s)); call('/api/show?s='+s+'&on='+(on?1:0)); });
 sb.onclick=()=>{ if(!st) return; call('/api/standby?on='+(st.standby?0:1)); };
+svc.onsubmit=e=>{ e.preventDefault(); const v=ledIn.value.trim(); if(v==='') return; call('/api/blink?led='+encodeURIComponent(v)); };
 call('/api/status');
 setInterval(()=>{ if(!document.hidden) call('/api/status'); },5000);
 </script></body></html>)HTML";
@@ -98,12 +112,13 @@ static void sendStatusJson() {
 
   char buf[384];
   int n = snprintf(buf, sizeof(buf),
-      "{\"show\":%u,\"standby\":%s,"
+      "{\"show\":%u,\"standby\":%s,\"blink\":%ld,"
       "\"colors\":{\"1\":\"%s\",\"2\":\"%s\",\"4\":\"%s\"},"
       "\"entries\":%u,\"known\":%u,\"free\":%u,\"reserve\":%u,\"sold\":%u,"
       "\"fetch_age_s\":%ld,\"uptime_s\":%lu,\"heap\":%lu}",
       (unsigned)boardGetShowMask(),
       boardGetStandby() ? "true" : "false",
+      (long)boardBlinkLed(),
       boardStatusColorHex(STATUS_FREE),
       boardStatusColorHex(STATUS_RESERVE),
       boardStatusColorHex(STATUS_SOLD),
@@ -178,6 +193,26 @@ static void handleStandby() {
   sendStatusJson();
 }
 
+/** /api/blink?led=<0..NUM_LEDS-1>  -- debug: cycle one LED R/G/B until a
+ *  status toggle is clicked. */
+static void handleBlink() {
+  if (!server.hasArg("led")) {
+    server.send(400, "application/json", "{\"error\":\"need led\"}");
+    return;
+  }
+  const String &v = server.arg("led");
+  bool digits = v.length() > 0;
+  for (size_t i = 0; i < v.length() && digits; i++) digits = isDigit(v[i]);
+  long led = digits ? v.toInt() : -1;
+  if (led < 0 || led > 0xFFFF || !boardStartBlink((uint16_t)led)) {
+    server.send(400, "application/json", "{\"error\":\"led out of range\"}");
+    return;
+  }
+  Serial.printf("[web] %s blink LED %ld\n",
+                server.client().remoteIP().toString().c_str(), led);
+  sendStatusJson();
+}
+
 /** Browsers request this on every page load; answer cheaply instead of 404. */
 static void handleFavicon() {
   server.send(204, "image/x-icon", "");
@@ -208,6 +243,7 @@ void webBegin() {
     server.on("/api/status", HTTP_GET, handleStatusRoute);
     server.on("/api/show",    HTTP_ANY, handleShow);     // GET or POST both fine
     server.on("/api/standby", HTTP_ANY, handleStandby);
+    server.on("/api/blink",   HTTP_ANY, handleBlink);
     server.on("/favicon.ico", HTTP_GET, handleFavicon);
     server.onNotFound(handleNotFound);
     server.begin();

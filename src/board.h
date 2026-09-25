@@ -14,22 +14,31 @@ static const uint8_t STATUS_SOLD    = 4;   // ПРОДАНО
 
 /** Which statuses are drawn: bit N set => offices with system_status N are
  *  lit in their colour. Only STATUS_FREE / STATUS_RESERVE / STATUS_SOLD are
- *  toggleable; every other status is never lit. Persisted in NVS. */
+ *  toggleable; every other status is never lit. Not persisted: every boot
+ *  starts with all three on. */
 static const uint8_t SHOW_BIT_FREE    = 1u << STATUS_FREE;
 static const uint8_t SHOW_BIT_RESERVE = 1u << STATUS_RESERVE;
 static const uint8_t SHOW_BIT_SOLD    = 1u << STATUS_SOLD;
 static const uint8_t SHOW_MASK_ALL    = SHOW_BIT_FREE | SHOW_BIT_RESERVE | SHOW_BIT_SOLD;
 
 uint8_t boardGetShowMask();
-/** Bits outside SHOW_MASK_ALL are ignored. Repaints the strip and persists. */
+/** Bits outside SHOW_MASK_ALL are ignored. Counts as user activity: leaves
+ *  STANDBY, stops a debug blink, restarts the auto-standby countdown, repaints. */
 void    boardSetShowMask(uint8_t mask);
 /** true if `status` is one of the three toggleable statuses. */
 bool    boardStatusToggleable(uint8_t status);
 
 /** STANDBY: no data is sent to the strip (it is blanked once on entry) and
- *  STANDBY_LED_PIN is driven HIGH. Not persisted -- always off after boot. */
+ *  STANDBY_LED_PIN is driven HIGH. Not persisted -- always off after boot.
+ *  Entered automatically after STANDBY_AFTER_MINUTES without a toggle click. */
 bool    boardGetStandby();
 void    boardSetStandby(bool on);
+
+/** Debug: blink one LED red/green/blue (all others dark) until a status toggle
+ *  is clicked or standby is entered. false if `led` is out of range. */
+bool    boardStartBlink(uint16_t led);
+/** LED currently blinking, or -1. */
+int32_t boardBlinkLed();
 
 /** "#RRGGBB" currently configured for `status` (1..7), or the fallback colour. */
 const char *boardStatusColorHex(uint8_t status);
